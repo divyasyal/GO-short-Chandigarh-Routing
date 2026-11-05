@@ -1,0 +1,263 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Chandigarh Smart Path Navigator</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html,body,#map {
+      height:100%; margin:0; padding:0;
+      font-family:'Segoe UI',sans-serif;
+      background:#f9f9f9;
+    }
+    #map { z-index:1; }
+    .panel {
+      position:absolute; top:10px; left:10px; z-index:1000;
+      background:rgba(255,255,255,0.97);
+      padding:15px 20px; border-radius:12px;
+      box-shadow:0 4px 12px rgba(0,0,0,0.15);
+      width:320px; max-height:88%; overflow:auto;
+      transition: all 0.3s ease;
+    }
+    h2 {
+      font-size:18px; margin:0 0 10px 0; color:#2c3e50; text-align:center;
+    }
+    label { font-size:14px; font-weight:500; color:#333; display:block; margin-top:6px; }
+    input,select {
+      width:100%; padding:7px 8px; margin-top:4px;
+      border:1px solid #ccc; border-radius:6px; font-size:14px;
+    }
+    button {
+      background:#007bff; color:white; border:none;
+      padding:9px 12px; border-radius:6px; font-size:14px;
+      cursor:pointer; width:100%; margin-top:8px;
+    }
+    button:hover { background:#0056b3; }
+    .info { margin-top:10px; font-size:13px; color:#333; line-height:1.4; }
+    .status { margin-top:8px; font-size:13px; color:#222; font-weight:500; }
+    .path-details {
+      background:#eef5ff; margin-top:10px; padding:8px; border-radius:8px;
+      font-size:13px; color:#222;
+    }
+    .toggle-btn {
+      background:#222; color:white; padding:5px 8px;
+      border-radius:6px; font-size:12px; cursor:pointer;
+      position:absolute; top:10px; right:10px; z-index:1001;
+    }
+    .legend {
+      position:absolute; bottom:10px; left:10px; background:rgba(255,255,255,0.9);
+      border-radius:8px; padding:6px 10px; font-size:13px; color:#333;
+      box-shadow:0 2px 5px rgba(0,0,0,0.15);
+    }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="toggle-btn" id="themeToggle">🌙 Dark</div>
+
+<div class="panel" id="panel">
+  <h2>🚶‍♂️ Smart Shortest Path</h2>
+
+  <label>Search Start:</label>
+  <input id="startName" placeholder="e.g. Rose Garden Chandigarh">
+  <button id="searchStart">🔍 Search Start</button>
+
+  <label>Search Destination:</label>
+  <input id="endName" placeholder="e.g. Sukhna Lake">
+  <button id="searchEnd">🔍 Search Destination</button>
+
+  <label>Source Node ID:</label>
+  <input id="srcid" placeholder="click map or enter id" />
+
+  <label>Destination Node ID:</label>
+  <input id="dstid" placeholder="click map or enter id" />
+
+  <label>Mode:</label>
+  <select id="mode">
+    <option value="walk">🚶 Walking</option>
+    <option value="bike">🚴 Cycling</option>
+    <option value="drive">🚗 Driving</option>
+  </select>
+
+  <button id="go">Find Path</button>
+  <button id="reset">Reset</button>
+  <button id="download">⬇️ Download Path Data</button>
+
+  <div class="info">💡 Click map to pick nodes (1st = source, 2nd = destination).</div>
+  <div class="status" id="status">Ready.</div>
+
+  <div class="path-details" id="details" style="display:none;"></div>
+</div>
+
+<div class="legend">
+  <b>Legend:</b><br>
+  🔵 Node (sampled)<br>
+  🟢 Start<br>
+  🔴 Destination<br>
+  🔺 Path
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const server = "http://localhost:8080";
+let darkMode = false;
+const map = L.map('map').setView([30.7333,76.7794], 13);
+let lightLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'© OpenStreetMap'});
+let darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {maxZoom:19});
+lightLayer.addTo(map);
+
+let nodeLayer = L.layerGroup().addTo(map);
+let pathLayer = L.layerGroup().addTo(map);
+let nodeIndex = {};
+const status = document.getElementById('status');
+const details = document.getElementById('details');
+
+async function loadNodes(){
+  status.textContent = "Loading nodes...";
+  try {
+    const r = await fetch(server + "/nodes");
+    const j = await r.json();
+    nodeLayer.clearLayers(); nodeIndex = {};
+    let count = 0;
+    for(const f of j.features){
+      const id = f.properties.id;
+      const lat = f.geometry.coordinates[1];
+      const lon = f.geometry.coordinates[0];
+      nodeIndex[id] = {lat,lon};
+      if (count++ % 80 === 0) L.circleMarker([lat,lon], {radius:2, color:'#007bff', opacity:0.7}).addTo(nodeLayer);
+    }
+    status.textContent = `Loaded ${Object.keys(nodeIndex).length} nodes.`;
+  } catch(e) { console.error(e); status.textContent="Failed to load nodes."; }
+}
+loadNodes();
+
+// Reverse geocode helper
+async function getPlaceName(lat, lon) {
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`);
+    const j = await r.json();
+    return j.display_name || "Unknown location";
+  } catch { return "Unknown location"; }
+}
+
+// Search place to node
+async function geocodePlace(name, isStart=true) {
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(name)}`);
+    const j = await r.json();
+    if (!j.length) { alert("Place not found"); return; }
+    const {lat, lon} = j[0];
+    let best=null,bestd=1e99,bestid=null;
+    for(const id in nodeIndex){
+      const p=nodeIndex[id];
+      const dx=p.lon-lon, dy=p.lat-lat;
+      const d=dx*dx+dy*dy;
+      if(d<bestd){bestd=d;best=p;bestid=id;}
+    }
+    if(isStart){
+      document.getElementById('srcid').value=bestid;
+      status.textContent=`Start: ${name} (node ${bestid})`;
+      L.marker([lat,lon],{icon:L.divIcon({className:'start-icon',html:'🟢'})}).addTo(map);
+    } else {
+      document.getElementById('dstid').value=bestid;
+      status.textContent=`Destination: ${name} (node ${bestid})`;
+      L.marker([lat,lon],{icon:L.divIcon({className:'end-icon',html:'🔴'})}).addTo(map);
+    }
+  } catch(e){console.error(e);}
+}
+document.getElementById('searchStart').onclick=()=>geocodePlace(document.getElementById('startName').value,true);
+document.getElementById('searchEnd').onclick=()=>geocodePlace(document.getElementById('endName').value,false);
+
+let pickState = 0;
+map.on('click', async function(e){
+  let best=null,bestd=1e99,bestid=null;
+  const lat=e.latlng.lat,lon=e.latlng.lng;
+  for(const id in nodeIndex){
+    const p=nodeIndex[id];
+    const dx=p.lon-lon,dy=p.lat-lat;
+    const d=dx*dx+dy*dy;
+    if(d<bestd){bestd=d;best=p;bestid=id;}
+  }
+  if(!bestid) return;
+  const place=await getPlaceName(lat,lon);
+  if(pickState===0){
+    document.getElementById('srcid').value=bestid; pickState=1;
+    status.textContent=`Picked source: ${place} (node ${bestid})`;
+    L.marker([lat,lon],{icon:L.divIcon({className:'start-icon',html:'🟢'})}).addTo(map);
+  } else {
+    document.getElementById('dstid').value=bestid; pickState=0;
+    status.textContent=`Picked destination: ${place} (node ${bestid})`;
+    L.marker([lat,lon],{icon:L.divIcon({className:'end-icon',html:'🔴'})}).addTo(map);
+  }
+});
+
+document.getElementById('go').addEventListener('click', async ()=>{
+  const src=document.getElementById('srcid').value.trim();
+  const dst=document.getElementById('dstid').value.trim();
+  if(!src||!dst){alert('Enter both node IDs');return;}
+  pathLayer.clearLayers(); details.style.display='none';
+  status.textContent="Finding path...";
+  try {
+    const r=await fetch(server+`/shortest?src=${encodeURIComponent(src)}&dst=${encodeURIComponent(dst)}`);
+    const j=await r.json();
+    if(!j.path||j.path.length===0){status.textContent="No path found";return;}
+    const latlngs=j.path.map(p=>[p.lat,p.lon]);
+    let poly=L.polyline([], {color:'red',weight:5}).addTo(pathLayer);
+    // animate path
+    let i=0;
+    const drawInt=setInterval(()=>{
+      if(i<latlngs.length){poly.addLatLng(latlngs[i++]);}
+      else clearInterval(drawInt);
+    },10);
+    map.fitBounds(latlngs);
+    const distance=Number(j.distance).toFixed(1);
+    const mode=document.getElementById('mode').value;
+    const speeds={walk:5,bike:15,drive:40};
+    const speed=speeds[mode];
+    const timeMin=(distance/1000)/speed*60;
+    const srcNode=j.path[0],dstNode=j.path[j.path.length-1];
+    const srcName=await getPlaceName(srcNode.lat,srcNode.lon);
+    const dstName=await getPlaceName(dstNode.lat,dstNode.lon);
+    details.style.display='block';
+    details.innerHTML=`
+      <b>Start:</b> ${srcName}<br>
+      <b>Destination:</b> ${dstName}<br>
+      <b>Distance:</b> ${distance} m<br>
+      <b>Estimated ${mode} time:</b> ${timeMin.toFixed(1)} min<br>
+      <b>Nodes Followed:</b> ${j.path.length}<br>
+      <b>Node IDs:</b> ${j.path.map(p=>p.id).slice(0,20).join(', ')}${j.path.length>20?', ...':''}
+    `;
+    status.textContent="Path ready ✅";
+    window.currentPath=j;
+  } catch(e){console.error(e);status.textContent="Error fetching path";}
+});
+
+// Reset button
+document.getElementById('reset').onclick=()=>{
+  pathLayer.clearLayers(); nodeLayer.clearLayers();
+  loadNodes(); details.style.display='none';
+  document.getElementById('srcid').value='';
+  document.getElementById('dstid').value='';
+  document.getElementById('startName').value='';
+  document.getElementById('endName').value='';
+  status.textContent="Reset done.";
+};
+
+// Download button
+document.getElementById('download').onclick=()=>{
+  if(!window.currentPath){alert('No path yet');return;}
+  const blob=new Blob([JSON.stringify(window.currentPath,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='path_data.json'; a.click();
+};
+
+// Theme toggle
+document.getElementById('themeToggle').onclick=()=>{
+  if(darkMode){map.removeLayer(darkLayer); lightLayer.addTo(map); document.body.style.background='#f9f9f9'; document.getElementById('themeToggle').textContent='🌙 Dark';}
+  else {map.removeLayer(lightLayer); darkLayer.addTo(map); document.body.style.background='#111'; document.getElementById('themeToggle').textContent='☀️ Light';}
+  darkMode=!darkMode;
+};
+</script>
+</body>
+</html>
